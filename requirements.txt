@@ -3,4 +3,4 @@ anthropic
 pandas
 openpyxl
 Pillow
-streamlit-drawable-canvas
+streamlit-cropper
