@@ -12,20 +12,26 @@ if not api_key:
 
 client = Anthropic(api_key=api_key)
 
-photo = st.camera_input("현장 사진 촬영")
+source = st.radio("사진 입력 방식", ["카메라 촬영", "파일 업로드"], horizontal=True)
+
+if source == "카메라 촬영":
+    photo = st.camera_input("현장 사진 촬영")
+else:
+    photo = st.file_uploader("현장 사진 업로드", type=["jpg", "jpeg", "png", "webp"])
 
 if photo:
     st.image(photo, use_container_width=True)
     if st.button("위험요소 분석"):
         with st.spinner("분석 중..."):
             img_b64 = base64.b64encode(photo.getvalue()).decode()
+            mime = photo.type if photo.type in ("image/jpeg", "image/png", "image/webp", "image/gif") else "image/jpeg"
             response = client.messages.create(
                 model="claude-opus-4-5",
                 max_tokens=1024,
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                        {"type": "image", "source": {"type": "base64", "media_type": mime, "data": img_b64}},
                         {"type": "text", "text": "대한민국 산업안전보건법 전문가로서 이 사진의 위험요소, 관련 법령 조항, 개선대책을 표 형식으로 분석해줘."}
                     ]
                 }]
