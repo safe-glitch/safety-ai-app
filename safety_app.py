@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import io
+import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +22,23 @@ except Exception:
 ROLES = ["근로자", "관리감독자", "안전관리자", "보건관리자", "사업주/경영진", "기타"]
 DATA_DIR = Path(__file__).parent / "data"
 DB_PATH = DATA_DIR / "inspections.db"
+PROMPT_VERSION = "1.1"
+MODEL = "claude-opus-4-5"
+
+DISCLAIMER = (
+    "본 분석은 AI 참고용이며, 최종 판단·조치는 자격을 갖춘 안전관리자가 수행합니다. "
+    "법령·규정 관련 내용은 **미검증 추정**이며, 반드시 원문·전문가 확인이 필요합니다."
+)
 
 st.set_page_config(page_title="산업안전 AI 점검", layout="wide", page_icon="🦺")
+
+
+def get_api_key() -> str | None:
+    try:
+        key = st.secrets["ANTHROPIC_API_KEY"]
+        return key.strip() if key else None
+    except (KeyError, FileNotFoundError, AttributeError):
+        return None
 
 
 def get_conn() -> sqlite3.Connection:
@@ -40,13 +57,16 @@ def get_conn() -> sqlite3.Connection:
             work_type TEXT,
             risk_level TEXT,
             analysis TEXT NOT NULL,
-            focus_used INTEGER DEFAULT 0
+            focus_used INTEGER DEFAULT 0,
+            prompt_version TEXT
         )
         """
     )
     cols = {row[1] for row in conn.execute("PRAGMA table_info(inspections)")}
     if "focus_used" not in cols:
         conn.execute("ALTER TABLE inspections ADD COLUMN focus_used INTEGER DEFAULT 0")
+    if "prompt_version" not in cols:
+        conn.execute("ALTER TABLE inspections ADD COLUMN prompt_version TEXT")
     conn.commit()
     return conn
 
@@ -145,6 +165,7 @@ def load_records(conn: sqlite3.Connection) -> pd.DataFrame:
             work_type AS 작업내용,
             risk_level AS 위험등급,
             CASE focus_used WHEN 1 THEN 'Y' ELSE 'N' END AS 포커스사용,
+            prompt_version AS 분석버전,
             analysis AS 분석결과
         FROM inspections
         ORDER BY id DESC
@@ -160,13 +181,130 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def parse_json_response(text: str) -> dict | None:
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def validate_analysis(data: dict) -> bool:
+    if data.get("risk_level") not in ("상", "중", "하"):
+        return False
+    if not isinstance(data.get("hazards"), list) or not data["hazards"]:
+        return False
+    return True
+
+
+def normalize_risk_level(value: str | None) -> str:
+    if value in ("상", "중", "하"):
+        return value
+    return "미분류"
+
+
+def format_analysis_markdown(data: dict) -> str:
+    risk = normalize_risk_level(data.get("risk_level"))
+    lines = [
+        f"### 종합 위험등급: **{risk}**",
+        "",
+        data.get("summary", "").strip(),
+        "",
+        "| 위험요소 | 관찰 근거 | 관련 법령 분야(미검증) | 즉시조치 | 개선대책 | 담당 권장 |",
+        "|---|---|---|---|---|---|",
+    ]
+    for h in data.get("hazards", []):
+        lines.append(
+            "| {hazard} | {evidence} | {law_area} | {immediate} | {improve} | {role} |".format(
+                hazard=h.get("hazard", ""),
+                evidence=h.get("evidence", ""),
+                law_area=h.get("law_area", ""),
+                immediate=h.get("immediate_action", ""),
+                improve=h.get("improvement", ""),
+                role=h.get("responsible_role", ""),
+            )
+        )
+
+    lines.extend(["", "#### 근로자 즉시 행동"])
+    for i, action in enumerate(data.get("worker_actions", []), 1):
+        lines.append(f"{i}. {action}")
+
+    lines.extend(["", "#### 관리감독자 확인 사항"])
+    for i, check in enumerate(data.get("supervisor_checks", []), 1):
+        lines.append(f"{i}. {check}")
+
+    lines.extend(
+        [
+            "",
+            "---",
+            "*법령 분야는 AI 추정이며 조항 번호를 인용하지 않았습니다. 안전관리자가 원문을 확인하세요.*",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_analysis_prompt(user: dict, focus_img: Image.Image | None, focus_note: str) -> str:
+    focus_line = focus_note.strip() or "없음"
+    return f"""당신은 대한민국 산업안전 현장 점검 보조 AI입니다.
+반드시 아래 JSON 형식만 출력하세요. JSON 앞뒤에 다른 문장을 쓰지 마세요.
+
+점검자 정보:
+- 성명: {user['name']}
+- 소속: {user['department']}
+- 직책: {user['role']}
+- 사업장/위치: {user['site']}
+- 작업내용: {user['work_type'] or '미입력'}
+- 포커스 영역 사용: {"예" if focus_img is not None else "아니오"}
+- 점검자 메모: {focus_line}
+
+분석 규칙:
+- 포커스 이미지가 있으면 그 구간을 최우선 분석하세요.
+- 사진에서 보이는 근거만 적고 추측은 최소화하세요.
+- **법령 조항 번호(제00조 등)는 절대 쓰지 마세요.**
+- law_area에는 "보호구 착용", "고소작업 안전", "전기안전"처럼 **분야명만** 적고 (미검증)임을 전제로 하세요.
+
+JSON 스키마:
+{{
+  "risk_level": "상 또는 중 또는 하",
+  "summary": "2~3문장 요약",
+  "hazards": [
+    {{
+      "hazard": "위험요소",
+      "evidence": "사진에서 본 근거",
+      "law_area": "관련 법령 분야(미검증, 조항번호 금지)",
+      "immediate_action": "즉시조치",
+      "improvement": "개선대책",
+      "responsible_role": "담당 권장 직책"
+    }}
+  ],
+  "worker_actions": ["행동1", "행동2", "행동3"],
+  "supervisor_checks": ["확인1", "확인2", "확인3"]
+}}"""
+
+
 def analyze_image(
     client: Anthropic,
     full_img: Image.Image,
     user: dict,
     focus_img: Image.Image | None = None,
     focus_note: str = "",
-) -> str:
+) -> dict:
     content = [
         {"type": "text", "text": "아래는 현장 전체 사진입니다."},
         {
@@ -185,8 +323,8 @@ def analyze_image(
                 {
                     "type": "text",
                     "text": (
-                        "아래는 점검자가 위험요인으로 지정한 포커스(네모) 영역입니다. "
-                        "이 영역을 최우선으로 분석하고, 전체 사진 맥락은 보조로만 사용하세요."
+                        "아래는 점검자가 지정한 포커스(위험) 영역입니다. "
+                        "이 영역을 최우선으로 분석하세요."
                     ),
                 },
                 {
@@ -200,58 +338,69 @@ def analyze_image(
             ]
         )
 
-    focus_line = focus_note.strip() or "없음"
-    prompt = f"""당신은 대한민국 산업안전보건법 전문가입니다.
-회사 현장 안전점검을 위해 사진을 분석하세요.
-
-점검자 정보:
-- 성명: {user['name']}
-- 소속: {user['department']}
-- 직책: {user['role']}
-- 사업장/위치: {user['site']}
-- 작업내용: {user['work_type'] or '미입력'}
-- 포커스 영역 사용: {"예" if focus_img is not None else "아니오"}
-- 점검자 메모(포커스 설명): {focus_line}
-
-분석 규칙:
-- 포커스 이미지가 있으면 그 구간의 위험요인을 중심으로 구체적으로 적으세요.
-- 포커스 밖이라도 명백히 위험한 것은 추가로 짧게 언급하세요.
-- 추측은 줄이고, 사진에서 보이는 근거를 먼저 적으세요.
-
-아래 형식으로 한국어로 작성하세요.
-
-1) 종합 위험등급: 상 / 중 / 하 중 하나만
-2) 표: | 위험요소 | 관찰 근거(사진) | 관련 법령(조항) | 즉시조치 | 개선대책 | 담당 권장 직책 |
-3) 근로자가 바로 할 수 있는 행동 3가지
-4) 관리감독자가 확인해야 할 사항 3가지
-"""
+    prompt = build_analysis_prompt(user, focus_img, focus_note)
     content.append({"type": "text", "text": prompt})
 
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": content}],
+    last_raw = ""
+    for attempt in range(2):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1800,
+            messages=[{"role": "user", "content": content}],
+        )
+        last_raw = response.content[0].text
+        parsed = parse_json_response(last_raw)
+        if parsed and validate_analysis(parsed):
+            risk_level = normalize_risk_level(parsed.get("risk_level"))
+            return {
+                "risk_level": risk_level,
+                "analysis": format_analysis_markdown(parsed),
+                "parse_ok": True,
+            }
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    "이전 응답이 JSON 스키마를 따르지 않았습니다. "
+                    "risk_level은 상/중/하 중 하나, hazards는 1개 이상. "
+                    "JSON만 다시 출력하세요."
+                ),
+            }
+        )
+
+    return {
+        "risk_level": "미분류",
+        "analysis": (
+            "### 분석 결과 (형식 오류 — 수동 확인 필요)\n\n"
+            f"{last_raw}\n\n"
+            "---\n*AI 응답을 구조화하지 못했습니다. 안전관리자가 직접 검토하세요.*"
+        ),
+        "parse_ok": False,
+    }
+
+
+# ----- API Key (Secrets only) -----
+api_key = get_api_key()
+if not api_key:
+    st.error("Anthropic API Key가 설정되지 않았습니다.")
+    st.markdown(
+        """
+**Streamlit Cloud** → 앱 **Settings** → **Secrets**에 아래를 추가하세요:
+
+```toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+로컬 실행 시: `.streamlit/secrets.toml` 파일에 동일하게 넣으세요.
+        """
     )
-    return response.content[0].text
+    st.stop()
 
+client = Anthropic(api_key=api_key)
+conn = get_conn()
 
-def extract_risk_level(text: str) -> str:
-    for level in ("상", "중", "하"):
-        if f"위험등급: {level}" in text or f"위험등급 : {level}" in text:
-            return level
-        if f"종합 위험등급: {level}" in text or f"종합 위험등급 : {level}" in text:
-            return level
-    if "위험등급" in text:
-        idx = text.find("위험등급")
-        snippet = text[idx : idx + 20]
-        for level in ("상", "중", "하"):
-            if level in snippet:
-                return level
-    return "미분류"
-
-
-st.sidebar.header("회사 사용자 정보")
-api_key = st.sidebar.text_input("Anthropic API Key", type="password")
+# ----- Sidebar -----
+st.sidebar.header("점검자 정보")
 name = st.sidebar.text_input("성명 *")
 department = st.sidebar.text_input("소속(부서/팀) *")
 role = st.sidebar.selectbox("직책/역할 *", ROLES)
@@ -259,20 +408,16 @@ site = st.sidebar.text_input("사업장/위치 *", placeholder="예: 1공장 용
 work_type = st.sidebar.text_input("작업내용", placeholder="예: 고소작업, 지게차 하역")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("기록이 DB에 저장되고, 엑셀로 내려받을 수 있습니다.")
-
-if not api_key:
-    st.warning("왼쪽 사이드바에 Anthropic API Key를 입력하세요.")
-    st.stop()
-
-client = Anthropic(api_key=api_key)
-conn = get_conn()
+st.sidebar.caption("기록 저장 · 엑셀 다운로드 · 분석버전 " + PROMPT_VERSION)
 
 st.title("🦺 산업안전 AI 점검 시스템")
-st.caption("위험 구간에 네모 포커스를 지정하면, AI가 그 부분을 중심으로 분석합니다.")
+st.caption("위험 구간 포커스 → AI 참고 분석 → 기록 저장 (1인 개발 프로토타입)")
+
+st.info(DISCLAIMER)
 
 tab_inspect, tab_records, tab_excel = st.tabs(["① 현장 점검", "② 점검 기록", "③ 엑셀 다운로드"])
 
+# ----- Tab 1 -----
 with tab_inspect:
     missing = [
         label
@@ -298,7 +443,6 @@ with tab_inspect:
         st.subheader("위험 구간 포커스")
         use_focus = st.checkbox("포커스(네모)로 위험 구간 지정", value=True, key=f"use_focus_{pkey}")
 
-        focus_mode = "cropper"
         if use_focus:
             if HAS_CROPPER:
                 mode = st.radio(
@@ -309,7 +453,7 @@ with tab_inspect:
                 )
                 focus_mode = "cropper" if mode.startswith("드래그") else "slider"
             else:
-                st.warning("드래그 네모 패키지가 없어 슬라이더 방식으로 동작합니다. requirements에 streamlit-cropper를 넣어 재배포하세요.")
+                st.warning("streamlit-cropper 미설치 → 슬라이더 방식 사용")
                 focus_mode = "slider"
 
             if focus_mode == "cropper":
@@ -322,8 +466,8 @@ with tab_inspect:
                 focus_img = cropped
             else:
                 focus_img = None
-                if use_focus and cropped is not None:
-                    st.info("선택 영역이 거의 전체와 같습니다. 더 작게 줄이면 포커스 분석이 켜집니다.")
+                if cropped is not None:
+                    st.info("선택 영역이 거의 전체입니다. 더 작게 줄이면 포커스 분석이 켜집니다.")
 
             c1, c2 = st.columns(2)
             with c1:
@@ -336,14 +480,14 @@ with tab_inspect:
                 st.markdown("**잘린 포커스 영역**")
                 if focus_img is not None:
                     st.image(focus_img, use_container_width=True)
-                    st.success("포커스 적용됨 → 이 구간을 우선 분석합니다")
+                    st.success("포커스 적용됨")
                 else:
                     st.image(full_img, use_container_width=True)
-                    st.caption("포커스 미적용 · 전체 사진 기준으로 분석합니다")
+                    st.caption("포커스 미적용")
 
             focus_note = st.text_input(
                 "포커스 설명(선택)",
-                placeholder="예: 안전난간 미설치 / 전선 피복 손상 / PPE 미착용",
+                placeholder="예: 안전난간 미설치 / 전선 피복 손상",
                 key=f"focus_note_{pkey}",
             )
         else:
@@ -359,20 +503,21 @@ with tab_inspect:
                     "site": site.strip(),
                     "work_type": work_type.strip(),
                 }
-                analysis = analyze_image(
+                result = analyze_image(
                     client,
                     full_img,
                     user,
                     focus_img=focus_img,
                     focus_note=focus_note,
                 )
-                risk_level = extract_risk_level(analysis)
+                risk_level = result["risk_level"]
+                analysis = result["analysis"]
                 created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 conn.execute(
                     """
                     INSERT INTO inspections
-                    (created_at, name, department, role, site, work_type, risk_level, analysis, focus_used)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (created_at, name, department, role, site, work_type, risk_level, analysis, focus_used, prompt_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         created_at,
@@ -384,19 +529,22 @@ with tab_inspect:
                         risk_level,
                         analysis,
                         1 if focus_img is not None else 0,
+                        PROMPT_VERSION,
                     ),
                 )
                 conn.commit()
                 st.session_state["last_analysis"] = analysis
                 st.session_state["last_risk"] = risk_level
-                st.success(
-                    f"저장 완료 · 위험등급: {risk_level} · 포커스: {'사용' if focus_img is not None else '미사용'}"
-                )
+                msg = f"저장 완료 · 위험등급: {risk_level} · 포커스: {'사용' if focus_img else '미사용'}"
+                if not result["parse_ok"]:
+                    msg += " · ⚠️ 형식 오류(수동 확인)"
+                st.success(msg)
 
     if st.session_state.get("last_analysis"):
         st.subheader("최근 분석 결과")
         st.markdown(st.session_state["last_analysis"])
 
+# ----- Tab 2 -----
 with tab_records:
     df = load_records(conn)
     st.metric("누적 점검 건수", len(df))
@@ -424,9 +572,12 @@ with tab_records:
         view = view[mask]
 
     if view.empty:
-        st.info("아직 저장된 점검 기록이 없습니다. ① 현장 점검 탭에서 분석을 저장하세요.")
+        st.info("아직 저장된 점검 기록이 없습니다.")
     else:
-        show_cols = ["번호", "점검일시", "성명", "소속", "직책", "사업장_위치", "작업내용", "위험등급", "포커스사용"]
+        show_cols = [
+            "번호", "점검일시", "성명", "소속", "직책",
+            "사업장_위치", "작업내용", "위험등급", "포커스사용", "분석버전",
+        ]
         st.dataframe(view[show_cols], use_container_width=True, hide_index=True)
         selected = st.selectbox(
             "상세 보기 (번호 선택)",
@@ -439,18 +590,23 @@ with tab_records:
         detail = view[view["번호"] == selected].iloc[0]
         st.markdown(
             f"**{detail['성명']}** ({detail['직책']}) · {detail['소속']} · "
-            f"{detail['사업장_위치']} · 포커스 {detail['포커스사용']}"
+            f"{detail['사업장_위치']} · 위험 {detail['위험등급']}"
         )
         st.markdown(detail["분석결과"])
 
+# ----- Tab 3 -----
 with tab_excel:
     df = load_records(conn)
-    st.write("회사 안전점검 데이터를 엑셀로 내려받아 공유·보관할 수 있습니다.")
+    st.write("점검 데이터를 엑셀로 내려받을 수 있습니다.")
+    st.caption(DISCLAIMER)
 
     if df.empty:
         st.info("내려받을 데이터가 없습니다.")
     else:
-        show_cols = ["번호", "점검일시", "성명", "소속", "직책", "사업장_위치", "작업내용", "위험등급", "포커스사용"]
+        show_cols = [
+            "번호", "점검일시", "성명", "소속", "직책",
+            "사업장_위치", "작업내용", "위험등급", "포커스사용", "분석버전",
+        ]
         st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
         excel_bytes = to_excel_bytes(df)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -461,4 +617,3 @@ with tab_excel:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
-        st.caption("엑셀 시트명: 안전점검기록 · 분석결과 전문 포함")
